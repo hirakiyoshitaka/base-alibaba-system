@@ -1,17 +1,51 @@
 """CLI commands for 1688 product images."""
 
+import shutil
 import sys
+import tempfile
+from pathlib import Path
 
 from base_alibaba.services.image_service import (
     COOKIES_FILE,
     IMAGES_DIR,
     _dl_image,
+    _is_1688_detail_url,
     _playwright_download,
     _sanitize_dirname,
-    _selenium_download,
     cmd_images_login,
 )
 from base_alibaba.services.product_service import read_products
+
+
+_STATUS_MESSAGES = {
+    "not_logged_in": "ログイン未実施 → python tool.py images login を実行してください",
+    "login_required": "ログイン未実施 → python tool.py images login を実行してください",
+    "session_expired": "セッション期限切れ → python tool.py images login で再ログインしてください",
+    "captcha": "CAPTCHA/ブロック画面を検出しました。手動ログイン後に再実行してください",
+    "not_detail_url": "商品詳細URLではありません。detail.1688.com/offer/XXXXXX.html 形式にしてください",
+    "no_images": "画像URLが見つかりませんでした",
+    "download_failed": "画像URLは見つかりましたが、画像保存に失敗しました",
+    "playwright_not_installed": "Playwright未導入です",
+    "playwright_browser_not_installed": "PlaywrightのChromiumブラウザが未導入です",
+}
+
+
+def _print_image_failure(status: str, product_id: str):
+    message = _STATUS_MESSAGES.get(status)
+    if status.startswith("error:"):
+        message = f"予期しないエラー: {status[6:]}"
+    if message:
+        print(f"   ⚠️  {message}")
+    else:
+        print(f"   ⚠️  取得失敗: {status}")
+
+    if status == "playwright_not_installed":
+        print("      python -m pip install playwright")
+        print("      python -m playwright install chromium")
+    elif status == "playwright_browser_not_installed":
+        print("      python -m playwright install chromium")
+    elif status not in ("not_logged_in", "login_required", "session_expired"):
+        print(f"      手動登録: python tool.py images add --id {product_id} URL1 URL2 ...")
 
 
 def cmd_images_download(args):
@@ -43,9 +77,10 @@ def cmd_images_download(args):
         ali_url = p.get("alibaba_url", "")
         img_dir = IMAGES_DIR / _sanitize_dirname(name)
 
-        if "selloffer/offerlist" in ali_url or not ali_url.startswith("http"):
-            print(f"  ⚠️  スキップ（詳細URL未設定）: {name}")
-            print( "      → detail.1688.com/offer/XXXXXX.html 形式のURLに変更してください")
+        if not _is_1688_detail_url(ali_url):
+            print(f"  ⚠️  スキップ（商品詳細URLではない）: {name}")
+            print("      → detail.1688.com/offer/XXXXXX.html 形式のURLに変更してください")
+            total_ng += 1
             continue
 
         existing = list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png")) + list(img_dir.glob("*.webp"))
@@ -54,30 +89,42 @@ def cmd_images_download(args):
             total_ok += len(existing)
             continue
 
-        img_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n📦 {name}")
         print(f"   {ali_url}")
 
+        temp_dir = None
+        target_dir = img_dir
+        if existing and force:
+            temp_dir = Path(tempfile.mkdtemp(prefix=f"{img_dir.name}.", dir=IMAGES_DIR))
+            target_dir = temp_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+
         import importlib.util
         # 1. Playwright（セッション内DLで認証Cookie付き）
-        ok, status = _playwright_download(ali_url, img_dir,
-                                          headless=headless, interactive=interactive) \
-            if importlib.util.find_spec("playwright") else (0, "playwright_not_installed")
+        try:
+            ok, status = _playwright_download(ali_url, target_dir,
+                                              headless=headless, interactive=interactive) \
+                if importlib.util.find_spec("playwright") else (0, "playwright_not_installed")
+        except Exception as e:
+            ok, status = 0, f"error:{e}"
 
-        # 2. Selenium fallback
-        if ok == 0 and status not in ("captcha_unsolved", "session_expired"):
-            if importlib.util.find_spec("selenium"):
-                print("   Playwrightで取得できず → Seleniumで再試行...")
-                ok, status = _selenium_download(ali_url, img_dir)
+        if temp_dir:
+            if ok > 0:
+                img_dir.mkdir(parents=True, exist_ok=True)
+                for image_file in existing:
+                    try:
+                        image_file.unlink()
+                    except OSError as e:
+                        print(f"   ⚠️  既存画像を削除できませんでした: {image_file.name} ({e})")
+                for image_file in sorted(temp_dir.iterdir()):
+                    shutil.move(str(image_file), str(img_dir / image_file.name))
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
         print(f"   → {ok}枚保存: {img_dir}")
         total_ok += ok
         if ok == 0:
             total_ng += 1
-            if status in ("session_expired", "not_logged_in"):
-                print("   ⚠️  セッション期限切れ → python tool.py images login で再ログインしてください")
-            else:
-                print(f"   手動登録: python tool.py images add --id {p['id']} URL1 URL2 ...")
+            _print_image_failure(status, p["id"])
 
     print(f"\n{'─'*54}")
     print(f"✅ 完了: 合計 {total_ok}枚  |  保存先: {IMAGES_DIR}")
