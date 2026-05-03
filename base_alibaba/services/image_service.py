@@ -8,14 +8,14 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from base_alibaba.storage.paths import COOKIES_FILE, IMAGES_DIR
+from base_alibaba.storage.paths import CHROME_PROFILE_DIR, COOKIES_FILE, IMAGES_DIR
 from base_alibaba.utils.text import sanitize_dirname
 
 _IMG_EXTRACT_JS = """
 () => {
     const seen = new Set();
     const result = [];
-    const smallPat = /(_50x50|_60x60|_80x80|_100x100|favicon|logo|avatar|iconfont)/i;
+    const skipPat = /(_50x50|_60x60|_80x80|_100x100|favicon|logo|avatar|iconfont|icon|\.ico)/i;
     const imgPat = /(https?:)?\\/\\/[^"'<>\\s]+alicdn\\.com[^"'<>\\s]+?\\.(?:jpg|jpeg|png|webp)(?:\\?[^"'<>\\s]*)?/ig;
 
     function normalize(raw) {
@@ -25,11 +25,12 @@ _IMG_EXTRACT_JS = """
             .replace(/\\\\u002F/g, '/')
             .replace(/\\\\\\//g, '/')
             .trim();
+        s = s.split(/\\s+/)[0];  // srcset 対応
         if (s.startsWith('//')) s = 'https:' + s;
         if (!/^https?:\\/\\//i.test(s)) return null;
         s = s.split('#')[0].split('?')[0];
         if (!/alicdn\\.com/i.test(s) || !/\\.(jpg|jpeg|png|webp)$/i.test(s)) return null;
-        if (smallPat.test(s)) return null;
+        if (skipPat.test(s)) return null;
         return s;
     }
 
@@ -41,22 +42,50 @@ _IMG_EXTRACT_JS = """
         }
     }
 
-    document.querySelectorAll('img, source').forEach(el => {
-        ['src','data-src','data-lazy','data-original','data-img','srcset'].forEach(attr => {
-            const value = el.getAttribute(attr) || '';
-            value.split(',').forEach(part => add(part.trim().split(/\\s+/)[0]));
+    // ① 1688 商品ギャラリー専用セレクタ（最優先）
+    const gallerySels = [
+        '.detail-gallery-img img',
+        '.gallery-image img',
+        '.img-gallery img',
+        '[class*="gallery"] img',
+        '[class*="swiper"] img',
+        '.detail-main-img-wrap img',
+        '.main-images img',
+        '.product-image img',
+        '[class*="main-img"] img',
+        '[class*="pic-box"] img',
+        '.J_ImgBooth',
+        '[data-gallery-image]',
+    ];
+    for (const sel of gallerySels) {
+        document.querySelectorAll(sel).forEach(el => {
+            ['src','data-src','data-lazy','data-original','data-img'].forEach(attr => {
+                add(el.getAttribute(attr) || '');
+            });
         });
-    });
+    }
 
-    document.querySelectorAll('[style]').forEach(el => {
-        const style = el.getAttribute('style') || '';
+    // ② naturalWidth >= 400 px の img のみ（ロゴ・アイコン排除）
+    if (result.length < 3) {
+        document.querySelectorAll('img').forEach(el => {
+            const w = el.naturalWidth || el.width || 0;
+            if (w >= 400) {
+                ['src','data-src','data-lazy','data-original','data-img'].forEach(attr => {
+                    add(el.getAttribute(attr) || '');
+                });
+            }
+        });
+    }
+
+    // ③ HTML全体からalicdn URL抽出（フォールバック）
+    if (result.length < 3) {
+        const html = document.documentElement.innerHTML;
         let match;
-        while ((match = imgPat.exec(style)) !== null) add(match[0]);
-    });
-
-    const html = document.documentElement.innerHTML;
-    let match;
-    while ((match = imgPat.exec(html)) !== null) add(match[0]);
+        while ((match = imgPat.exec(html)) !== null) add(match[0]);
+        // サイズ付きURLを優先
+        const large = result.filter(u => /_(\\d{3,4}x\\d{3,4}|800|1000|900)/.test(u));
+        if (large.length >= 3) return large.slice(0, 15);
+    }
 
     return result.slice(0, 15);
 }
@@ -64,9 +93,23 @@ _IMG_EXTRACT_JS = """
 
 _USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 )
+_USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Safari/605.1.15",
+]
 _ACCEPT_LANGUAGE = "zh-CN,zh;q=0.9,ja-JP;q=0.8,ja;q=0.7,en-US;q=0.6,en;q=0.5"
+_SMALL_IMG_PAT = re.compile(
+    r'(_50x50|_60x60|_80x80|_100x100|_120x120|favicon|/logo|/icon|avatar|iconfont)',
+    re.IGNORECASE,
+)
+_ALICDN_HTML_PAT = re.compile(
+    r'(https?:)?//[^\s"\'<>\\]+?alicdn\.com[^\s"\'<>\\]+?\.(?:jpg|jpeg|png|webp)',
+    re.IGNORECASE,
+)
 _IMAGE_EXTENSIONS = ("jpg", "jpeg", "png", "webp")
 _AUTH_COOKIE_NAMES = {
     "_nk_",
@@ -86,41 +129,129 @@ _AUTH_COOKIE_NAMES = {
 }
 _STEALTH_INIT_SCRIPT = """
 (() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    // webdriver を完全に消す
+    Object.defineProperty(navigator, 'webdriver', {
+        get: () => undefined,
+        configurable: true,
+    });
+    try { delete navigator.__proto__.webdriver; } catch(_) {}
+
+    // 自動化フラグを消す
+    delete window.__nightmare;
+    delete window._phantom;
+    delete window.callPhantom;
+    delete window.__selenium_evaluate;
+    delete window.__webdriver_evaluate;
+    delete window.__driver_evaluate;
+    delete window.__webdriver_script_func;
+    delete window.__webdriverFunc;
+    delete window.domAutomation;
+    delete window.domAutomationController;
+
+    // navigator プロパティ偽装
     Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'ja-JP', 'ja', 'en-US', 'en'] });
     Object.defineProperty(navigator, 'platform', { get: () => 'MacIntel' });
     Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
     Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
     Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
+    Object.defineProperty(navigator, 'appVersion', {
+        get: () => '5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+    });
+    Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.' });
+
+    // plugins を本物らしく偽装
+    const makePlugin = (name, filename, description, mimeTypes) => {
+        const plugin = Object.create(Plugin.prototype);
+        Object.defineProperty(plugin, 'name', { get: () => name });
+        Object.defineProperty(plugin, 'filename', { get: () => filename });
+        Object.defineProperty(plugin, 'description', { get: () => description });
+        Object.defineProperty(plugin, 'length', { get: () => mimeTypes.length });
+        return plugin;
+    };
+    const fakePlugins = [
+        makePlugin('PDF Viewer', 'internal-pdf-viewer', 'Portable Document Format', ['application/pdf']),
+        makePlugin('Chrome PDF Viewer', 'internal-pdf-viewer', 'Portable Document Format', ['application/pdf']),
+        makePlugin('Chromium PDF Viewer', 'internal-pdf-viewer', 'Portable Document Format', ['application/pdf']),
+        makePlugin('Microsoft Edge PDF Viewer', 'internal-pdf-viewer', 'Portable Document Format', ['application/pdf']),
+        makePlugin('WebKit built-in PDF', 'internal-pdf-viewer', 'Portable Document Format', ['application/pdf']),
+    ];
     Object.defineProperty(navigator, 'plugins', {
-        get: () => [
-            { name: 'Chrome PDF Plugin' },
-            { name: 'Chrome PDF Viewer' },
-            { name: 'Native Client' },
-        ],
+        get: () => {
+            const arr = [...fakePlugins];
+            arr.__proto__ = PluginArray.prototype;
+            Object.defineProperty(arr, 'item', { value: (i) => arr[i] });
+            Object.defineProperty(arr, 'namedItem', { value: (n) => arr.find(p => p.name === n) || null });
+            Object.defineProperty(arr, 'refresh', { value: () => {} });
+            Object.defineProperty(arr, 'length', { get: () => fakePlugins.length });
+            return arr;
+        },
     });
 
-    window.chrome = window.chrome || {};
-    window.chrome.runtime = window.chrome.runtime || {};
-    window.chrome.app = window.chrome.app || {};
+    // chrome オブジェクトを本物らしく
+    const chrome = {
+        app: {
+            isInstalled: false,
+            InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+            RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' },
+        },
+        runtime: {
+            OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
+            OnRestartRequiredReason: { APP_UPDATE: 'app_update', GC_POLICY: 'gc_policy', OS_UPDATE: 'os_update' },
+            PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+            PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' },
+            RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' },
+        },
+        csi: () => ({ onloadT: Date.now(), pageT: Date.now(), startE: Date.now(), tran: 15 }),
+        loadTimes: () => ({
+            commitLoadTime: Date.now() / 1000 - 0.5,
+            connectionInfo: 'h2',
+            finishDocumentLoadTime: Date.now() / 1000 - 0.1,
+            finishLoadTime: Date.now() / 1000,
+            firstPaintAfterLoadTime: 0,
+            firstPaintTime: Date.now() / 1000 - 0.3,
+            navigationType: 'Other',
+            npnNegotiatedProtocol: 'h2',
+            requestTime: Date.now() / 1000 - 1,
+            startLoadTime: Date.now() / 1000 - 1,
+            wasAlternateProtocolAvailable: false,
+            wasFetchedViaSpdy: true,
+            wasNpnNegotiated: true,
+        }),
+    };
+    if (!window.chrome) window.chrome = chrome;
+    else Object.assign(window.chrome, chrome);
 
-    const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
-    if (originalQuery) {
-        window.navigator.permissions.query = (parameters) => (
-            parameters && parameters.name === 'notifications'
-                ? Promise.resolve({ state: Notification.permission })
-                : originalQuery.call(window.navigator.permissions, parameters)
-        );
+    // permissions.query の通知チェックを無害化
+    const origQuery = window.navigator.permissions && window.navigator.permissions.query.bind(window.navigator.permissions);
+    if (origQuery) {
+        window.navigator.permissions.query = (params) =>
+            params && params.name === 'notifications'
+                ? Promise.resolve({ state: 'default', onchange: null })
+                : origQuery(params);
     }
 
+    // WebGL レンダラー偽装
     if (window.WebGLRenderingContext) {
-        const getParameter = WebGLRenderingContext.prototype.getParameter;
-        WebGLRenderingContext.prototype.getParameter = function(parameter) {
-            if (parameter === 37445) return 'Intel Inc.';
-            if (parameter === 37446) return 'Intel Iris OpenGL Engine';
-            return getParameter.call(this, parameter);
+        const getParam = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(p) {
+            if (p === 37445) return 'Intel Inc.';
+            if (p === 37446) return 'Intel Iris Pro OpenGL Engine';
+            return getParam.call(this, p);
         };
     }
+    if (window.WebGL2RenderingContext) {
+        const getParam2 = WebGL2RenderingContext.prototype.getParameter;
+        WebGL2RenderingContext.prototype.getParameter = function(p) {
+            if (p === 37445) return 'Intel Inc.';
+            if (p === 37446) return 'Intel Iris Pro OpenGL Engine';
+            return getParam2.call(this, p);
+        };
+    }
+
+    // Notification を偽装
+    try {
+        Object.defineProperty(Notification, 'permission', { get: () => 'default' });
+    } catch(_) {}
 })();
 """
 
@@ -171,45 +302,51 @@ def _browser_context_options() -> dict:
     }
 
 
+_CHROME_EXECUTABLE = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+_CHROME_LAUNCH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-infobars",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--lang=zh-CN",
+    "--window-size=1366,768",
+]
+_IGNORE_DEFAULT_ARGS = ["--enable-automation", "--enable-blink-features=IdleDetection"]
+
+
 def _browser_launch_args(headless: bool) -> dict:
-    args = [
-        "--disable-blink-features=AutomationControlled",
-        "--disable-infobars",
-        "--disable-popup-blocking",
-        "--disable-notifications",
-        "--disable-extensions",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--lang=zh-CN",
-        "--window-size=1366,768",
-    ]
     options = {
         "headless": headless,
-        "args": args,
-        "ignore_default_args": ["--enable-automation"],
+        "args": _CHROME_LAUNCH_ARGS,
+        "ignore_default_args": _IGNORE_DEFAULT_ARGS,
     }
     if not headless:
-        options["slow_mo"] = random.randint(40, 110)
+        options["slow_mo"] = random.randint(50, 130)
     return options
 
 
 def _launch_chromium(playwright, headless: bool):
-    """Prefer the user's normal Chrome for login, then fall back to bundled Chromium."""
+    """Playwrightバンドル Chromium を起動する。
+    macOS では既存 Chrome との singleton 競合が起きるため、
+    real Chrome / channel='chrome' は使わない。
+    """
     options = _browser_launch_args(headless)
-    if not headless:
-        try:
-            return playwright.chromium.launch(channel="chrome", **options)
-        except Exception:
-            pass
     return playwright.chromium.launch(**options)
 
 
 def _apply_stealth(page):
+    try:
+        from playwright_stealth import Stealth
+        Stealth().apply_stealth_sync(page)
+    except Exception:
+        pass
     page.add_init_script(_STEALTH_INIT_SCRIPT)
 
 
 def _human_wait(page, min_ms: int = 700, max_ms: int = 1800):
-    page.wait_for_timeout(random.randint(min_ms, max_ms))
+    import time as _t
+    _t.sleep(random.randint(min_ms, max_ms) / 1000)
 
 
 def _debug_login_path() -> Path:
@@ -347,7 +484,7 @@ def _is_playwright_browser_missing_error(error: Exception) -> bool:
     return "Executable doesn't exist" in text or "playwright install" in text
 
 def _urllib_download(url: str, dest: Path) -> bool:
-    """alicdn画像をurllib直接DL（ログイン不要）。2KB未満は失敗扱い。"""
+    """alicdn画像をurllib直接DL。20KB未満は失敗扱い（ロゴ・プレースホルダー排除）。"""
     try:
         normalized = _normalize_image_url(url)
         if not normalized:
@@ -362,7 +499,7 @@ def _urllib_download(url: str, dest: Path) -> bool:
         req = urllib.request.Request(normalized, headers=headers)
         with urllib.request.urlopen(req, timeout=20) as resp:
             data = resp.read()
-        if len(data) < 2000:
+        if len(data) < 20_000:
             return False
         dest.write_bytes(data)
         return True
@@ -439,112 +576,290 @@ def _bulk_download(img_urls: list[str], save_dir: Path) -> int:
     return ok
 
 
-def cmd_images_login(_args):
-    """Open a browser for QR login and save Playwright storage_state."""
+def _persistent_context_options() -> dict:
+    """launch_persistent_context 共通オプション。"""
+    return {
+        "headless": False,
+        "args": _CHROME_LAUNCH_ARGS,
+        "ignore_default_args": _IGNORE_DEFAULT_ARGS,
+        "slow_mo": random.randint(60, 150),
+        **_browser_context_options(),
+    }
+
+
+def _clear_chrome_profile_locks():
+    """起動前に古い SingletonLock 等を削除してプロファイル競合を防ぐ。"""
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket", "RunningChromeVersion"):
+        p = CHROME_PROFILE_DIR / name
+        try:
+            if p.is_symlink() or p.exists():
+                p.unlink()
+        except OSError:
+            pass
+
+
+def _launch_persistent_ctx(playwright):
+    """本物のChromeで persistent context を起動する。なければ Chromium。"""
+    import os
+    CHROME_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    _clear_chrome_profile_locks()
+    opts = _persistent_context_options()
+    if os.path.exists(_CHROME_EXECUTABLE):
+        try:
+            return playwright.chromium.launch_persistent_context(
+                str(CHROME_PROFILE_DIR), executable_path=_CHROME_EXECUTABLE, **opts
+            )
+        except Exception as e:
+            print(f"   [Chrome] 起動失敗、Chromiumにフォールバック: {e!s:.120}")
     try:
-        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        return playwright.chromium.launch_persistent_context(
+            str(CHROME_PROFILE_DIR), channel="chrome", **opts
+        )
+    except Exception:
+        pass
+    return playwright.chromium.launch_persistent_context(str(CHROME_PROFILE_DIR), **opts)
+
+
+def cmd_images_login(_args):
+    """永続Chromeプロファイルでログインし、以降の自動取得を可能にする。"""
+    try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        print("❌ Playwrightが未導入です。以下を実行してください:")
-        print("   python -m pip install playwright")
-        print("   python -m playwright install chromium")
+        print("❌ Playwrightが未導入です:")
+        print("   pip install playwright && python -m playwright install chromium")
         return
 
-    COOKIES_FILE.parent.mkdir(parents=True, exist_ok=True)
-    print("🌐 1688ログイン用ブラウザを開きます。QRコードでログインしてください。")
-    print("   ログイン完了後、このターミナルで Enter を押すとCookieを保存します。")
+    print("🌐 1688ログイン用ブラウザを起動します。")
+    print("   ① QRコードをスキャン or パスワードでログイン")
+    print("   ② ログイン完了後、このターミナルで Enter を押してください\n")
 
     with sync_playwright() as p:
-        browser = None
         try:
-            browser = _launch_chromium(p, headless=False)
-            ctx = browser.new_context(
-                **_browser_context_options(),
-            )
-            page = ctx.new_page()
-            _apply_stealth(page)
+            ctx = _launch_persistent_ctx(p)
         except Exception as e:
-            if browser:
-                browser.close()
             if _is_playwright_browser_missing_error(e):
-                print("❌ PlaywrightのChromiumブラウザが未導入です。以下を実行してください:")
-                print("   python -m playwright install chromium")
+                print("❌ Chromiumが未導入です: python -m playwright install chromium")
             else:
                 print(f"❌ ブラウザを起動できませんでした: {e}")
             return
 
         try:
-            page.goto("https://www.1688.com/", wait_until="domcontentloaded", timeout=90000)
-            page.wait_for_timeout(3000)
-            _log_page_state(page, "1688トップ")
-            _reload_blank_login_page(page, "1688トップ")
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            _apply_stealth(page)
 
-            login_url = "https://login.taobao.com/member/login.jhtml?redirectURL=https%3A%2F%2Fwww.1688.com%2F"
-            page.goto(login_url, wait_until="domcontentloaded", timeout=90000)
-            _human_wait(page, 3000, 4500)
-            _log_page_state(page, "taobaoログイン")
-            _reload_blank_login_page(page, "taobaoログイン")
-        except PlaywrightTimeoutError:
-            print("⚠️  ログインページの読み込みがタイムアウトしました。表示済みならそのままログインしてください。")
-            _log_page_state(page, "timeout")
-            _save_login_debug_screenshot(page, "timeout")
-        except Exception as e:
-            print(f"❌ ログインページを開けませんでした: {e}")
-            _log_page_state(page, "goto_failed")
-            _save_login_debug_screenshot(page, "goto_failed")
-            browser.close()
-            return
-
-        if sys.stdin.isatty():
+            # セッション実検証：www.1688.com にアクセスしてログイン済みか確認
+            session_valid = False
             try:
-                input("ログインが完了したら Enter を押してください: ")
-            except EOFError:
-                print("❌ 入力が閉じられたため、Cookie保存前に終了します。通常のターミナルで再実行してください。")
-                _save_login_debug_screenshot(page, "stdin_eof")
-                browser.close()
+                page.goto("https://www.1688.com/", wait_until="domcontentloaded", timeout=30000)
+                _sleep(random.uniform(2.0, 3.0))
+                cur = page.url
+                if "login.taobao.com" not in cur and "login.1688.com" not in cur and _has_auth_cookie(ctx.cookies()):
+                    session_valid = True
+            except Exception:
+                pass
+
+            if session_valid:
+                print("✅ すでにログイン済みです。python tool.py images download を実行してください。")
+                COOKIES_FILE.parent.mkdir(parents=True, exist_ok=True)
+                ctx.storage_state(path=str(COOKIES_FILE))
                 return
-        else:
-            print("   非対話環境のため、最大180秒ログイン完了を待ちます。")
-            page.wait_for_timeout(180000)
 
+            print("   セッション期限切れ。ログインページへ移動します…")
+
+            # ログインページへ
+            login_url = (
+                "https://login.taobao.com/member/login.jhtml"
+                "?redirectURL=https%3A%2F%2Fwww.1688.com%2F"
+            )
+            try:
+                page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
+                _human_wait(page, 2500, 4000)
+                _reload_blank_login_page(page, "login")
+            except Exception as e:
+                print(f"⚠️  ログインページの読み込みに失敗しました: {e}")
+                _save_login_debug_screenshot(page, "login_goto_failed")
+
+            if sys.stdin.isatty():
+                try:
+                    input("ログインが完了したら Enter を押してください: ")
+                except EOFError:
+                    print("❌ 標準入力が閉じられました。通常のターミナルで再実行してください。")
+                    return
+            else:
+                import time as _time
+                print("   ブラウザでQRコードをスキャンしてください（最大180秒）…")
+                deadline = _time.monotonic() + 180
+                while _time.monotonic() < deadline:
+                    _time.sleep(2)
+                    try:
+                        page.evaluate("null")
+                    except Exception:
+                        print("   ⚠️ ブラウザが閉じられました")
+                        break
+                    # ログイン済みになったら早期終了
+                    try:
+                        if _has_auth_cookie(ctx.cookies()):
+                            print("   ✅ ログイン検出、続行します")
+                            break
+                    except Exception:
+                        break
+
+            # ログイン確認
+            try:
+                page.goto("https://www.1688.com/", wait_until="domcontentloaded", timeout=30000)
+                _human_wait(page, 1500, 2500)
+            except Exception:
+                pass
+
+            cookies = ctx.cookies()
+            cur = page.url
+            title = ""
+            try:
+                title = page.title()
+            except Exception:
+                pass
+
+            captcha = "punish" in cur or "验证码" in title or "captcha" in title.lower()
+            still_login = "login.1688.com" in cur or "login.taobao.com" in cur
+
+            if captcha:
+                print("❌ CAPTCHA検出。ブラウザで解除後、再度 images login を実行してください。")
+                _save_login_debug_screenshot(page, "captcha")
+                return
+
+            if still_login or not _has_auth_cookie(cookies):
+                print("❌ ログイン完了を確認できませんでした。QRログイン後にもう一度実行してください。")
+                _save_login_debug_screenshot(page, "not_confirmed")
+                return
+
+            # プロファイルはpersistent contextが自動保存。JSONも念のため保存。
+            COOKIES_FILE.parent.mkdir(parents=True, exist_ok=True)
+            ctx.storage_state(path=str(COOKIES_FILE))
+            print(f"✅ ログイン完了。プロファイル: {CHROME_PROFILE_DIR}")
+            print("   次に実行: python tool.py images download")
+
+        finally:
+            ctx.close()
+
+
+def _sleep(seconds: float):
+    import time as _t
+    _t.sleep(seconds)
+
+
+def _fetch_one_product(page, product_url: str, img_dir: Path) -> tuple[int, str]:
+    """既存のページオブジェクトで1商品を取得する（バッチ処理内部用）。"""
+    try:
+        page.goto(product_url, wait_until="domcontentloaded", timeout=45000)
+    except Exception as e:
+        return 0, f"error:{e}"
+    _sleep(random.uniform(3.0, 5.0))
+
+    cur = page.url
+    if "login.taobao.com" in cur or "login.1688.com" in cur:
+        return 0, "session_expired"
+
+    title = page.title()
+    if "punish" in cur or "验证码" in title or "captcha" in title.lower():
+        print("   🔒 CAPTCHAが表示されました。ブラウザで解除後、Enterを押してください。")
         try:
-            page.goto("https://www.1688.com/", wait_until="domcontentloaded", timeout=90000)
-            _human_wait(page, 1500, 3000)
-            _log_page_state(page, "ログイン確認")
-            _reload_blank_login_page(page, "ログイン確認")
-        except Exception:
-            _log_page_state(page, "ログイン確認失敗")
-            _save_login_debug_screenshot(page, "post_login_check_failed")
-
+            input("   ブラウザでCAPTCHAを解除したら Enter: ")
+        except EOFError:
+            print("   120秒待機します（ブラウザで解除してください）…")
+            _sleep(120)
+        _sleep(random.uniform(2.0, 3.0))
         cur = page.url
-        title = ""
+        title = page.title()
+        if "punish" in cur or "验証码" in title or "captcha" in title.lower():
+            return 0, "captcha"
+
+    for y in [400, 800, 1200, 1600]:
+        page.evaluate(f"window.scrollTo(0, {y})")
+        _sleep(random.uniform(0.6, 1.4))
+
+    urls: list[str] = page.evaluate(_IMG_EXTRACT_JS) or []
+    urls = [u for u in (_normalize_image_url(u) for u in urls) if u]
+    if not urls:
+        return 0, "no_images"
+
+    img_dir.mkdir(parents=True, exist_ok=True)
+    ok = _bulk_download(urls, img_dir)
+    return ok, ("ok" if ok else "download_failed")
+
+
+def batch_download_with_profile(
+    tasks: list[tuple[str, Path]],
+) -> list[tuple[int, str]]:
+    """1つのブラウザセッションで複数商品を順番にダウンロードする。
+
+    persistent_context は macOS で既存 Chrome と衝突するため使わず、
+    regular launch + storage_state (COOKIES_FILE) を使う。
+    """
+    if not COOKIES_FILE.exists() and not CHROME_PROFILE_DIR.exists():
+        return [(0, "profile_not_found")] * len(tasks)
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return [(0, "playwright_not_installed")] * len(tasks)
+
+    results: list[tuple[int, str]] = []
+
+    with sync_playwright() as p:
+        # regular launch — プロファイル競合なし
         try:
-            title = page.title()
-        except Exception:
-            pass
-        cookies = ctx.cookies()
-        has_auth_cookie = _has_auth_cookie(cookies)
-        still_login = "login.1688.com" in cur or "login.taobao.com" in cur
-        captcha = "punish" in cur or "验证码" in title or "captcha" in title.lower()
+            browser = _launch_chromium(p, headless=False)
+        except Exception as e:
+            status = "playwright_browser_not_installed" if _is_playwright_browser_missing_error(e) else f"error:{e}"
+            return [(0, status)] * len(tasks)
 
-        if captcha:
-            print("❌ CAPTCHA/ブロック画面を検出しました。ブラウザで解除後、再度 images login を実行してください。")
-            _save_login_debug_screenshot(page, "captcha")
-            browser.close()
-            return
-        if still_login or not has_auth_cookie:
-            print("❌ ログイン完了を確認できませんでした。QRログイン後にもう一度実行してください。")
-            _save_login_debug_screenshot(page, "login_not_confirmed")
-            browser.close()
-            return
+        try:
+            ctx_opts = _browser_context_options()
+            if COOKIES_FILE.exists():
+                try:
+                    ctx = browser.new_context(storage_state=str(COOKIES_FILE), **ctx_opts)
+                except Exception:
+                    ctx = browser.new_context(**ctx_opts)
+            else:
+                ctx = browser.new_context(**ctx_opts)
 
-        ctx.storage_state(path=str(COOKIES_FILE))
-        browser.close()
-        print(f"✅ Cookieを保存しました: {COOKIES_FILE}")
-        print("   次に実行: python tool.py images download")
+            page = ctx.new_page()
+            _apply_stealth(page)
+
+            import time as _time
+            for i, (url, img_dir) in enumerate(tasks):
+                if not _is_1688_detail_url(url):
+                    results.append((0, "not_detail_url"))
+                    continue
+
+                if i > 0:
+                    wait_s = random.uniform(3.0, 6.0)
+                    print(f"   ⏳ {wait_s:.1f}秒待機中…")
+                    _time.sleep(wait_s)
+
+                ok, status = _fetch_one_product(page, url, img_dir)
+                results.append((ok, status))
+
+        except Exception as e:
+            while len(results) < len(tasks):
+                results.append((0, f"error:{e}"))
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+    return results
+
+
+def _playwright_download_with_profile(product_url: str, img_dir: Path) -> tuple[int, str]:
+    """単一商品用ラッパー（後方互換）。"""
+    res = batch_download_with_profile([(product_url, img_dir)])
+    return res[0]
 
 
 def _playwright_download(product_url: str, img_dir: Path, headless: bool = False, interactive: bool = False) -> tuple[int, str]:
+    """Cookie JSONを使った旧方式ダウンロード（フォールバック用）。"""
     try:
         urls, status = _playwright_extract_urls(product_url, headless=headless)
         if status != "ok":
@@ -559,10 +874,96 @@ def _playwright_download(product_url: str, img_dir: Path, headless: bool = False
         return 0, f"error:{e}"
 
 
-def _selenium_download(product_url: str, img_dir: Path) -> tuple[int, str]:
-    print("   この機能は未実装です。次に実装してください: Selenium画像取得")
-    return 0, "unimplemented"
-
-
 def _dl_image(url: str, dest: Path) -> bool:
     return _urllib_download(url, dest)
+
+
+def _extract_images_from_html(html: str) -> list[str]:
+    """HTML文字列からalicdn.com商品画像URLを抽出して返す。"""
+    seen: set[str] = set()
+    result: list[str] = []
+
+    for match in _ALICDN_HTML_PAT.finditer(html):
+        raw = match.group(0)
+        # JSON内のエスケープ (\/) を修正
+        raw = raw.replace("\\/", "/").replace("\\u002F", "/")
+        url = _normalize_image_url(raw)
+        if url and url not in seen and not _SMALL_IMG_PAT.search(url):
+            seen.add(url)
+            result.append(url)
+
+    # サイズ付き（_720x720 等）を優先。なければ全件
+    large = [u for u in result if re.search(r'_\d{3,4}x\d{3,4}', u)]
+    return (large or result)[:15]
+
+
+def _requests_extract_images(product_url: str) -> tuple[list[str], str]:
+    """requestsで1688商品ページを取得し画像URLを抽出する（ログイン不要・CAPTCHA回避）。
+
+    Returns:
+        (image_urls, status)  status: "ok" | "login_required" | "captcha" |
+                              "no_images" | "not_detail_url" | "requests_not_installed" |
+                              "http_NNN" | "error:..."
+    """
+    if not _is_1688_detail_url(product_url):
+        return [], "not_detail_url"
+
+    try:
+        import requests as _req
+    except ImportError:
+        return [], "requests_not_installed"
+
+    headers = {
+        "User-Agent": random.choice(_USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,ja;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Referer": "https://www.1688.com/",
+    }
+
+    # 保存済みCookieがあれば付与
+    req_cookies: dict[str, str] = {}
+    if COOKIES_FILE.exists():
+        try:
+            cookie_list = _cookie_list_from_state(_load_saved_cookie_state())
+            parsed = urllib.parse.urlparse(product_url)
+            host = parsed.hostname or ""
+            for c in cookie_list:
+                domain = str(c.get("domain", "")).lstrip(".")
+                n, v = c.get("name"), c.get("value")
+                if domain and n and v is not None:
+                    if host == domain or host.endswith(f".{domain}"):
+                        req_cookies[n] = str(v)
+        except Exception:
+            pass
+
+    try:
+        session = _req.Session()
+        resp = session.get(
+            product_url,
+            headers=headers,
+            cookies=req_cookies or None,
+            timeout=30,
+            allow_redirects=True,
+        )
+    except Exception as e:
+        return [], f"error:{e}"
+
+    if resp.status_code != 200:
+        return [], f"http_{resp.status_code}"
+
+    final_url = resp.url
+    html = resp.text
+
+    if "login.taobao.com" in final_url or "login.1688.com" in final_url:
+        return [], "login_required"
+    if any(x in html for x in ["验证码", "punish", "captcha"]):
+        return [], "captcha"
+
+    urls = _extract_images_from_html(html)
+    return (urls, "ok") if urls else ([], "no_images")

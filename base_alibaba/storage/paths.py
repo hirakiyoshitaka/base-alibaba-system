@@ -10,6 +10,7 @@ WEBHOOK_CONFIG = DATA_DIR / "webhook_config.json"
 WEBHOOK_LOG = DATA_DIR / "webhook_log.jsonl"
 NOTION_CONFIG = DATA_DIR / "notion_config.json"
 COOKIES_FILE = DATA_DIR / "1688_cookies.json"
+CHROME_PROFILE_DIR = DATA_DIR / "chrome_profile_1688"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 IMAGES_DIR = PROJECT_ROOT / "images"
